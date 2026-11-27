@@ -1,5 +1,10 @@
 """
-NetHunt -> Meta Conversions API: успішні угоди (етап "Завершена угода") як DealWon / CallDealWon.
+NetHunt -> Meta Conversions API:
+  - успішні угоди (етап "Завершена угода") як DealWon / CallDealWon;
+  - потенційні угоди (у "В2С угоди" з'явився бюджет) як PotentialPurchase / PotentialCall,
+    одна подія на угоду (event_id = pot_<ID>), цінність = бюджет на момент виявлення,
+    event_time = момент виявлення (для разового досилання з meta_potential_backfill.txt - час створення угоди);
+    стан - аркуш meta_potential у Google Таблиці; угоди, створені понад 6 днів тому, не відправляються.
 
 ТЗ: "передача успешных сделок из CRM в Meta Conversions API".
 Запускається GitHub Actions кожні 15 хв (опитування API NetHunt замість вебхука, ТЗ розд. 4 п. 4).
@@ -47,6 +52,11 @@ SITE_CONTACT_TYPES = {"кошик", "чат"}
 CALL_TYPES = {"вхідний"}                             # вхідний дзвінок -> CallDealWon
 SITE_SOURCE_TAGS = {"кошик", "корзина", "get call", "chat online"}  # теги "Джерело", якщо "Тип" порожній
 BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_backfill.txt")
+# Потенційні: угода з сайту / вхідний дзвінок, у якій з'явився бюджет -> PotentialPurchase / PotentialCall
+POT_SITE_EVENT, POT_CALL_EVENT = "PotentialPurchase", "PotentialCall"
+POT_BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_potential_backfill.txt")
+POT_MAX_PER_RUN = 150      # решта піде наступним запуском
+POT_KEEP_DAYS = 14
 CURRENCY = "UAH"
 MAX_AGE_DAYS = 6
 RETRY_DELAYS_MIN = [1, 10, 60]   # далі кожні 6 год
@@ -225,19 +235,9 @@ def close_time(f, now):
     return close, None
 
 
-def build_event(deal, contact, now):
+def build_user_data(deal, contact):
     f = deal.get("fields") or {}
     cf = (contact or {}).get("fields") or {}
-    etime, skip = close_time(f, now)
-    if skip:
-        return None, skip
-    value = to_num(f.get(F["budget"]))
-    if value <= 0:
-        return None, "waiting: no budget"  # не блокує: відправиться, коли з'явиться бюджет
-
-    is_call = deal_kind(f) == "call"
-    deal_id = rec_id(deal)
-
     ud = {}
     phones = {norm_phone(p) for p in values(cf.get(C["phone"])) + values(f.get(F["deal_phone"]))} - {""}
     if phones:
@@ -260,19 +260,36 @@ def build_event(deal, contact, now):
         v = first(f.get(F[key]))
         if v:
             ud[meta_key] = v
+    return ud
 
+
+def make_event(deal, contact, name, event_id, etime, value, is_call):
+    f = deal.get("fields") or {}
     event = {
-        "event_name": "CallDealWon" if is_call else "DealWon",
+        "event_name": name,
         "event_time": int(etime.timestamp()),
-        "event_id": f"deal_{deal_id}",
+        "event_id": event_id,
         "action_source": "phone_call" if is_call else "system_generated",
-        "user_data": ud,
-        "custom_data": {"value": value, "currency": CURRENCY, "order_id": deal_id},
+        "user_data": build_user_data(deal, contact),
+        "custom_data": {"value": value, "currency": CURRENCY, "order_id": rec_id(deal)},
     }
     url = first(f.get(F["url"]))
     if url and not is_call:
         event["event_source_url"] = url
-    return event, None
+    return event
+
+
+def build_event(deal, contact, now):
+    f = deal.get("fields") or {}
+    etime, skip = close_time(f, now)
+    if skip:
+        return None, skip
+    value = to_num(f.get(F["budget"]))
+    if value <= 0:
+        return None, "waiting: no budget"  # не блокує: відправиться, коли з'явиться бюджет
+    is_call = deal_kind(f) == "call"
+    return make_event(deal, contact, "CallDealWon" if is_call else "DealWon", f"deal_{rec_id(deal)}",
+                      etime, value, is_call), None
 
 
 def send_to_meta(event):
@@ -309,7 +326,8 @@ def open_sheets():
     return (ws("meta_state", ["key", "value"]),
             ws("meta_queue", ["deal_id", "attempts", "next_try", "last_error"]),
             ws("meta_log", ["time", "mode", "deal_id", "deal_no", "event", "value", "user_data_fields",
-                            "http", "result", "fbtrace_id"]))
+                            "http", "result", "fbtrace_id"]),
+            ws("meta_potential", ["deal_id", "deal_no", "event", "value", "event_time", "sent_at", "status"]))
 
 
 def read_kv(w):
@@ -333,6 +351,93 @@ def notify(text):
             pass
 
 
+# ---------------- потенційні ----------------
+
+def process_potential(updated, w_pot, now, mode, log_rows):
+    """Угоди з бюджетом -> PotentialPurchase / PotentialCall, по одній події на угоду.
+    Стан (що вже відправлено) - аркуш meta_potential. Повертає список критичних помилок."""
+    rows = w_pot.get_all_values()[1:]
+    pot = {r[0]: r for r in rows if r and r[0]}
+    done = {k for k, r in pot.items() if len(r) > 6 and not r[6].startswith("retry")}
+
+    # кандидати: свіжі зміни (event_time = зараз) + разове досилання з файлу (event_time = створення угоди)
+    cands = [(d, False) for d in updated if rec_id(d) not in done]
+    seen = {rec_id(d) for d, _ in cands}
+    if os.path.exists(POT_BACKFILL_FILE):
+        for line in open(POT_BACKFILL_FILE, encoding="utf-8"):
+            deal_id = line.split("#")[0].strip()
+            if deal_id and deal_id not in done and deal_id not in seen:
+                cands.append((deal_id, True))
+                seen.add(deal_id)
+
+    contacts, errors, sent_count = {}, [], 0
+    for item, from_file in cands:
+        if sent_count >= POT_MAX_PER_RUN:
+            break
+        deal = find_record(DEALS_FOLDER_ID, item) if from_file else item
+        if not deal:
+            continue
+        deal_id = rec_id(deal)
+        f = deal.get("fields") or {}
+        kind = deal_kind(f)
+        value = to_num(f.get(F["budget"]))
+        created = parse_dt(deal.get("createdAt"))
+        if kind is None or value <= 0 or created is None:
+            continue
+        if now - created > timedelta(days=MAX_AGE_DAYS):
+            # стара угода, якій просто щось змінили: бюджет з'явився давно, Meta таку подію вже не прийме
+            continue
+        prev = pot.get(deal_id)
+        if prev and len(prev) > 4 and prev[4]:
+            etime = parse_dt(prev[4])          # повтор після помилки - той самий час події
+        else:
+            etime = min(created, now) if from_file else now
+        if etime is None or now - etime > timedelta(days=MAX_AGE_DAYS):
+            continue
+        is_call = kind == "call"
+        name = POT_CALL_EVENT if is_call else POT_SITE_EVENT
+        cid = first(f.get(F["contact"]))
+        if cid and cid not in contacts:
+            contacts[cid] = find_record(CONTACTS_FOLDER_ID, cid)
+        event = make_event(deal, contacts.get(cid), name, f"pot_{deal_id}", etime, value, is_call)
+        code, body = send_to_meta(event)
+        sent_count += 1
+        stamp = now.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        deal_no = first(f.get(F["number"]))
+        fbtrace = ""
+        if isinstance(body, dict):
+            fbtrace = body.get("fbtrace_id") or (body.get("error") or {}).get("fbtrace_id", "")
+        fields_used = ",".join(sorted(event["user_data"].keys()))
+        etime_s = etime.isoformat(timespec="seconds")
+        if code == 200 and isinstance(body, dict) and body.get("events_received") == 1:
+            status = "sent (test)" if mode == "test" else "sent"
+            pot[deal_id] = [deal_id, deal_no, name, value, etime_s, stamp, status]
+            log_rows.append([stamp, mode, deal_id, deal_no, name, value, fields_used, code, "sent", fbtrace])
+        else:
+            err_obj = body.get("error") if isinstance(body, dict) else None
+            err = (err_obj.get("message") if isinstance(err_obj, dict) else None) or str(body)[:200]
+            retryable = code is None or code >= 500 or code == 429 or (
+                isinstance(err_obj, dict) and err_obj.get("code") in (4, 17, 32, 613))
+            pot[deal_id] = [deal_id, deal_no, name, value, etime_s, stamp,
+                            ("retry: " if retryable else "error: ") + err[:200]]
+            log_rows.append([stamp, mode, deal_id, deal_no, name, value, fields_used, code or "", f"error: {err}", fbtrace])
+            if not retryable:
+                auth = isinstance(err_obj, dict) and err_obj.get("code") in (102, 190)
+                msg = (f"META CAPI: ТОКЕН ВІДХИЛЕНО, усі відправки зупинено. {err}" if auth
+                       else f"META CAPI: помилка {name} для угоди {deal_no or deal_id}: {err} (fbtrace {fbtrace})")
+                notify(msg)
+                errors.append(msg)
+                if auth:
+                    break
+        time.sleep(0.1)
+
+    cutoff = now - timedelta(days=POT_KEEP_DAYS)
+    keep = [r for r in pot.values() if not parse_dt(r[4] if len(r) > 4 else None) or parse_dt(r[4]) >= cutoff]
+    write_rows(w_pot, keep, 7)
+    print(f"potential: candidates={len(cands)} sent_attempts={sent_count}")
+    return errors
+
+
 # ---------------- основний цикл ----------------
 
 def main():
@@ -341,7 +446,7 @@ def main():
         return
     now = datetime.now(timezone.utc)
     mode = "test" if TEST_CODE else "prod"
-    w_state, w_queue, w_log = open_sheets()
+    w_state, w_queue, w_log, w_pot = open_sheets()
     state = read_kv(w_state)
     queue = {r[0]: {"attempts": int(r[1] or 0), "next_try": r[2], "last_error": r[3] if len(r) > 3 else ""}
              for r in w_queue.get_all_values()[1:] if r and r[0]}
@@ -434,6 +539,11 @@ def main():
             if auth:
                 break
         time.sleep(0.2)
+
+    # ---------- потенційні угоди (з'явився бюджет) ----------
+    if not any("ТОКЕН ВІДХИЛЕНО" in m for m in hard_errors):
+        pot_errors = process_potential(updated, w_pot, now, mode, log_rows)
+        hard_errors += pot_errors
 
     # (угоди старші 6 днів самі вийдуть з черги: build_event поверне skipped)
 
