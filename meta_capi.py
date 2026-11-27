@@ -47,16 +47,22 @@ DEALS_FOLDER_ID = "62a208e4331b7b685df23e2d"     # В2С угоди
 CONTACTS_FOLDER_ID = "62a208e4331b7b685df23e2e"  # Контакти
 WON_STAGE = "Завершена угода"
 # Відправляємо ЛИШЕ угоди з сайту (поле "Тип" або "Тип звернення"). Усе інше ігнорується без запису статусу.
-SITE_TYPES = {"кошик", "get call", "chat online"}   # -> DealWon
-SITE_CONTACT_TYPES = {"кошик", "чат"}
-CALL_TYPES = {"вхідний"}                             # вхідний дзвінок -> CallDealWon
-SITE_SOURCE_TAGS = {"кошик", "корзина", "get call", "chat online"}  # теги "Джерело", якщо "Тип" порожній
+# Кошик -> DealWon / PotentialPurchase; Вхідний, Get Call, Chat Online -> CallDealWon / PotentialCall
+SITE_TYPES = {"кошик"}
+CALL_TYPES = {"вхідний", "get call", "chat online"}
+SITE_SOURCE_TAGS = {"кошик", "корзина"}              # теги "Джерело", якщо "Тип" порожній
+CALL_SOURCE_TAGS = {"вхідний", "get call", "chat online"}
+SITE_CONTACT_TYPES = {"кошик"}                       # "Тип звернення", якщо і "Джерело" не допомогло
+CALL_CONTACT_TYPES = {"чат"}
+RECLASS_WON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_reclass_won.txt")
 BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_backfill.txt")
 # Потенційні: угода з сайту / вхідний дзвінок, у якій з'явився бюджет -> PotentialPurchase / PotentialCall
 POT_SITE_EVENT, POT_CALL_EVENT = "PotentialPurchase", "PotentialCall"
 POT_BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_potential_backfill.txt")
 POT_MAX_PER_RUN = 150      # решта піде наступним запуском
+POT_MAX_LOOKUPS = 400      # не більше стільки запитів до NetHunt за запуск на перевірку старих записів
 POT_KEEP_DAYS = 14
+POT_BACKFILL_UNTIL = datetime(2026, 12, 4, tzinfo=timezone.utc)  # після цього файл досилання ігнорується
 CURRENCY = "UAH"
 MAX_AGE_DAYS = 6
 RETRY_DELAYS_MIN = [1, 10, 60]   # далі кожні 6 год
@@ -204,7 +210,7 @@ def norm_city(s):
 # ---------------- подія ----------------
 
 def deal_kind(f):
-    """'site' (DealWon), 'call' (CallDealWon) або None (не відправляємо).
+    """'site' (кошик: DealWon), 'call' (вхідний / Get Call / Chat Online: CallDealWon) або None.
     Спершу поле "Тип"; якщо порожнє - теги "Джерело"; далі "Тип звернення"."""
     t = first(f.get(F["type"])).lower()
     if t:
@@ -212,10 +218,13 @@ def deal_kind(f):
     tags = {x.lower() for x in values(f.get(F["source"]))}
     if tags & SITE_SOURCE_TAGS:
         return "site"
-    if tags & CALL_TYPES:
+    if tags & CALL_SOURCE_TAGS:
         return "call"
-    if first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES:
+    ct = first(f.get(F["contact_type"])).lower()
+    if ct in SITE_CONTACT_TYPES:
         return "site"
+    if ct in CALL_CONTACT_TYPES:
+        return "call"
     return None
 
 
@@ -327,7 +336,7 @@ def open_sheets():
             ws("meta_queue", ["deal_id", "attempts", "next_try", "last_error"]),
             ws("meta_log", ["time", "mode", "deal_id", "deal_no", "event", "value", "user_data_fields",
                             "http", "result", "fbtrace_id"]),
-            ws("meta_potential", ["deal_id", "deal_no", "event", "value", "event_time", "sent_at", "status"]))
+            ws("meta_potential", ["deal_id", "deal_no", "event", "value", "event_time", "sent_at", "status", "checked"]))
 
 
 def read_kv(w):
@@ -357,23 +366,29 @@ def process_potential(updated, w_pot, now, mode, log_rows):
     """Угоди з бюджетом -> PotentialPurchase / PotentialCall, по одній події на угоду.
     Стан (що вже відправлено) - аркуш meta_potential. Повертає список критичних помилок."""
     rows = w_pot.get_all_values()[1:]
-    pot = {r[0]: r for r in rows if r and r[0]}
-    done = {k for k, r in pot.items() if len(r) > 6 and not r[6].startswith("retry")}
+    pot = {r[0]: (r + [""] * 8)[:8] for r in rows if r and r[0]}
+    # PotentialPurchase, відправлені до 27.11 14:35 (тоді Get Call / Chat Online теж ішли як Purchase), перевіряємо ще раз
+    recheck = {k for k, r in pot.items() if r[2] == POT_SITE_EVENT and r[6].startswith("sent") and r[7] != "v2"}
+    done = {k for k, r in pot.items() if r[6] and not r[6].startswith("retry") and k not in recheck}
 
     # кандидати: свіжі зміни (event_time = зараз) + разове досилання з файлу (event_time = створення угоди)
     cands = [(d, False) for d in updated if rec_id(d) not in done]
     seen = {rec_id(d) for d, _ in cands}
-    if os.path.exists(POT_BACKFILL_FILE):
+    if os.path.exists(POT_BACKFILL_FILE) and now < POT_BACKFILL_UNTIL:
         for line in open(POT_BACKFILL_FILE, encoding="utf-8"):
             deal_id = line.split("#")[0].strip()
             if deal_id and deal_id not in done and deal_id not in seen:
                 cands.append((deal_id, True))
                 seen.add(deal_id)
+    for deal_id in recheck - seen:
+        cands.append((deal_id, True))
 
-    contacts, errors, sent_count = {}, [], 0
+    contacts, errors, sent_count, lookups = {}, [], 0, 0
     for item, from_file in cands:
-        if sent_count >= POT_MAX_PER_RUN:
+        if sent_count >= POT_MAX_PER_RUN or (from_file and lookups >= POT_MAX_LOOKUPS):
             break
+        if from_file:
+            lookups += 1
         deal = find_record(DEALS_FOLDER_ID, item) if from_file else item
         if not deal:
             continue
@@ -382,20 +397,25 @@ def process_potential(updated, w_pot, now, mode, log_rows):
         kind = deal_kind(f)
         value = to_num(f.get(F["budget"]))
         created = parse_dt(deal.get("createdAt"))
-        if kind is None or value <= 0 or created is None:
-            continue
-        if now - created > timedelta(days=MAX_AGE_DAYS):
-            # стара угода, якій просто щось змінили: бюджет з'явився давно, Meta таку подію вже не прийме
-            continue
         prev = pot.get(deal_id)
-        if prev and len(prev) > 4 and prev[4]:
+        if kind is None or value <= 0 or created is None or now - created > timedelta(days=MAX_AGE_DAYS):
+            # стара угода, якій просто щось змінили: бюджет з'явився давно, Meta таку подію вже не прийме
+            if prev:
+                prev[7] = "v2"
+            continue
+        is_call = kind == "call"
+        name = POT_CALL_EVENT if is_call else POT_SITE_EVENT
+        if prev and prev[6].startswith("sent") and prev[2] == name:
+            prev[7] = "v2"                      # уже відправлено з правильною назвою
+            continue
+        if prev and prev[4]:
             etime = parse_dt(prev[4])          # повтор після помилки - той самий час події
         else:
             etime = min(created, now) if from_file else now
         if etime is None or now - etime > timedelta(days=MAX_AGE_DAYS):
+            if prev:
+                prev[7] = "v2"
             continue
-        is_call = kind == "call"
-        name = POT_CALL_EVENT if is_call else POT_SITE_EVENT
         cid = first(f.get(F["contact"]))
         if cid and cid not in contacts:
             contacts[cid] = find_record(CONTACTS_FOLDER_ID, cid)
@@ -411,7 +431,7 @@ def process_potential(updated, w_pot, now, mode, log_rows):
         etime_s = etime.isoformat(timespec="seconds")
         if code == 200 and isinstance(body, dict) and body.get("events_received") == 1:
             status = "sent (test)" if mode == "test" else "sent"
-            pot[deal_id] = [deal_id, deal_no, name, value, etime_s, stamp, status]
+            pot[deal_id] = [deal_id, deal_no, name, value, etime_s, stamp, status, "v2"]
             log_rows.append([stamp, mode, deal_id, deal_no, name, value, fields_used, code, "sent", fbtrace])
         else:
             err_obj = body.get("error") if isinstance(body, dict) else None
@@ -419,7 +439,7 @@ def process_potential(updated, w_pot, now, mode, log_rows):
             retryable = code is None or code >= 500 or code == 429 or (
                 isinstance(err_obj, dict) and err_obj.get("code") in (4, 17, 32, 613))
             pot[deal_id] = [deal_id, deal_no, name, value, etime_s, stamp,
-                            ("retry: " if retryable else "error: ") + err[:200]]
+                            ("retry: " if retryable else "error: ") + err[:200], "v2"]
             log_rows.append([stamp, mode, deal_id, deal_no, name, value, fields_used, code or "", f"error: {err}", fbtrace])
             if not retryable:
                 auth = isinstance(err_obj, dict) and err_obj.get("code") in (102, 190)
@@ -433,7 +453,7 @@ def process_potential(updated, w_pot, now, mode, log_rows):
 
     cutoff = now - timedelta(days=POT_KEEP_DAYS)
     keep = [r for r in pot.values() if not parse_dt(r[4] if len(r) > 4 else None) or parse_dt(r[4]) >= cutoff]
-    write_rows(w_pot, keep, 7)
+    write_rows(w_pot, keep, 8)
     print(f"potential: candidates={len(cands)} sent_attempts={sent_count}")
     return errors
 
@@ -466,6 +486,31 @@ def main():
                 d = find_record(DEALS_FOLDER_ID, deal_id)
                 if d and not first((d.get("fields") or {}).get(F["sent_at"])):
                     deals[deal_id] = d
+    # разова переправка: угоди Get Call / Chat Online, що до 27.11 14:35 пішли як DealWon -> CallDealWon
+    reclassed = set(filter(None, state.get("won_reclassed", "").split(",")))
+    if os.path.exists(RECLASS_WON_FILE):
+        for line in open(RECLASS_WON_FILE, encoding="utf-8"):
+            deal_id = line.split("#")[0].strip()
+            if not deal_id or deal_id in reclassed:
+                continue
+            d = find_record(DEALS_FOLDER_ID, deal_id)
+            f = (d or {}).get("fields") or {}
+            if not d or first(f.get(F["stage"])) != WON_STAGE or deal_kind(f) != "call":
+                reclassed.add(deal_id)
+                continue
+            cid = first(f.get(F["contact"]))
+            ev, skip = build_event(d, find_record(CONTACTS_FOLDER_ID, cid) if cid else None, now)
+            stamp = now.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+            if skip:
+                reclassed.add(deal_id)
+                continue
+            code, body = send_to_meta(ev)
+            ok = code == 200 and isinstance(body, dict) and body.get("events_received") == 1
+            print(f"reclass {first(f.get(F['number']))}: {ev['event_name']} http={code} ok={ok}")
+            if ok:
+                reclassed.add(deal_id)
+        state["won_reclassed"] = ",".join(sorted(reclassed))
+
     # повтори, яким настав час
     for deal_id, q in queue.items():
         if deal_id not in deals and parse_dt(q["next_try"]) and parse_dt(q["next_try"]) <= now:

@@ -1,0 +1,3 @@
+# Разово: завершені угоди Get Call / Chat Online, які 27.11 пішли як DealWon -> дослати як CallDealWon
+6afd84c34b41961b93a96631  # B2C47448 Chat Online
+6b03ef89a9ec94378f7d3c62  # B2C47653 Get Call
