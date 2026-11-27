@@ -42,8 +42,9 @@ DEALS_FOLDER_ID = "62a208e4331b7b685df23e2d"     # В2С угоди
 CONTACTS_FOLDER_ID = "62a208e4331b7b685df23e2e"  # Контакти
 WON_STAGE = "Завершена угода"
 # Відправляємо ЛИШЕ угоди з сайту (поле "Тип" або "Тип звернення"). Усе інше ігнорується без запису статусу.
-SITE_TYPES = {"кошик", "get call", "chat online"}
+SITE_TYPES = {"кошик", "get call", "chat online"}   # -> DealWon
 SITE_CONTACT_TYPES = {"кошик", "чат"}
+CALL_TYPES = {"вхідний"}                             # вхідний дзвінок -> CallDealWon
 CURRENCY = "UAH"
 MAX_AGE_DAYS = 6
 RETRY_DELAYS_MIN = [1, 10, 60]   # далі кожні 6 год
@@ -191,8 +192,9 @@ def norm_city(s):
 # ---------------- подія ----------------
 
 def is_site_deal(f):
-    return (first(f.get(F["type"])).lower() in SITE_TYPES
-            or first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES)
+    """Угоди, які відправляємо: із сайту (кошик, Get Call, чат) + вхідні дзвінки."""
+    t = first(f.get(F["type"])).lower()
+    return t in SITE_TYPES or t in CALL_TYPES or first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES
 
 
 def close_time(f, now):
@@ -221,7 +223,7 @@ def build_event(deal, contact, now):
     if value <= 0:
         return None, "waiting: no budget"  # не блокує: відправиться, коли з'явиться бюджет
 
-    is_call = False  # CallDealWon вимкнено: передаємо лише угоди з сайту
+    is_call = first(f.get(F["type"])).lower() in CALL_TYPES
     deal_id = rec_id(deal)
 
     ud = {}
