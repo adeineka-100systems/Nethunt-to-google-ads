@@ -45,6 +45,8 @@ WON_STAGE = "Завершена угода"
 SITE_TYPES = {"кошик", "get call", "chat online"}   # -> DealWon
 SITE_CONTACT_TYPES = {"кошик", "чат"}
 CALL_TYPES = {"вхідний"}                             # вхідний дзвінок -> CallDealWon
+SITE_SOURCE_TAGS = {"кошик", "корзина", "get call", "chat online"}  # теги "Джерело", якщо "Тип" порожній
+BACKFILL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "meta_backfill.txt")
 CURRENCY = "UAH"
 MAX_AGE_DAYS = 6
 RETRY_DELAYS_MIN = [1, 10, 60]   # далі кожні 6 год
@@ -59,7 +61,7 @@ TEST_CODE = os.environ.get("META_TEST_EVENT_CODE", "").strip()
 F = {
     "stage": "Етап", "budget": "Бюджет", "type": "Тип", "contact_type": "Тип звернення",
     "close_analytics": "дата закриття угоди для аналітики", "close_date": "Дата укладання угоди",
-    "contact": "Основний контакт", "deal_phone": "Телефон в угоді", "number": "номер угоди",
+    "contact": "Основний контакт", "source": "Джерело", "deal_phone": "Телефон в угоді", "number": "номер угоди",
     "fbc": "fbc", "fbp": "fbp", "ip": "fb_client_ip", "ua": "fb_user_agent", "url": "fb_source_url",
     "sent_at": "meta_sent_at", "sent_value": "meta_sent_value", "status": "meta_status",
 }
@@ -191,10 +193,20 @@ def norm_city(s):
 
 # ---------------- подія ----------------
 
-def is_site_deal(f):
-    """Угоди, які відправляємо: із сайту (кошик, Get Call, чат) + вхідні дзвінки."""
+def deal_kind(f):
+    """'site' (DealWon), 'call' (CallDealWon) або None (не відправляємо).
+    Спершу поле "Тип"; якщо порожнє - теги "Джерело"; далі "Тип звернення"."""
     t = first(f.get(F["type"])).lower()
-    return t in SITE_TYPES or t in CALL_TYPES or first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES
+    if t:
+        return "site" if t in SITE_TYPES else "call" if t in CALL_TYPES else None
+    tags = {x.lower() for x in values(f.get(F["source"]))}
+    if tags & SITE_SOURCE_TAGS:
+        return "site"
+    if tags & CALL_TYPES:
+        return "call"
+    if first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES:
+        return "site"
+    return None
 
 
 def close_time(f, now):
@@ -223,7 +235,7 @@ def build_event(deal, contact, now):
     if value <= 0:
         return None, "waiting: no budget"  # не блокує: відправиться, коли з'явиться бюджет
 
-    is_call = first(f.get(F["type"])).lower() in CALL_TYPES
+    is_call = deal_kind(f) == "call"
     deal_id = rec_id(deal)
 
     ud = {}
@@ -336,7 +348,19 @@ def main():
     since_key = "since"
     since = state.get(since_key) or (now - timedelta(days=MAX_AGE_DAYS)).isoformat()
 
-    deals = {rec_id(d): d for d in fetch_updated(DEALS_FOLDER_ID, since)}
+    updated = fetch_updated(DEALS_FOLDER_ID, since)
+    deals = {rec_id(d): d for d in updated}
+    if len(updated) >= 100:
+        # API NetHunt віддає не більше 100 найновіших змін: частина могла не потрапити
+        state["warning"] = f"{now.astimezone(TZ):%Y-%m-%d %H:%M}: отримано 100 змін за запуск, можливі пропуски"
+    # одноразове досилання: ID угод із meta_backfill.txt (уже відправлені пропускаються)
+    if os.path.exists(BACKFILL_FILE):
+        for line in open(BACKFILL_FILE, encoding="utf-8"):
+            deal_id = line.split("#")[0].strip()
+            if deal_id and deal_id not in deals:
+                d = find_record(DEALS_FOLDER_ID, deal_id)
+                if d and not first((d.get("fields") or {}).get(F["sent_at"])):
+                    deals[deal_id] = d
     # повтори, яким настав час
     for deal_id, q in queue.items():
         if deal_id not in deals and parse_dt(q["next_try"]) and parse_dt(q["next_try"]) <= now:
@@ -347,7 +371,7 @@ def main():
     log_rows, hard_errors = [], []
     for deal_id, deal in deals.items():
         f = deal.get("fields") or {}
-        if first(f.get(F["stage"])) != WON_STAGE or not is_site_deal(f):
+        if first(f.get(F["stage"])) != WON_STAGE or deal_kind(f) is None:
             queue.pop(deal_id, None)
             continue
         status = first(f.get(F["status"]))
