@@ -1,0 +1,27 @@
+name: NetHunt -> Google Ads adjustments
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # щогодини о :17 (UTC)
+  workflow_dispatch:        # ручний запуск з вкладки Actions
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python sync.py
+        env:
+          NETHUNT_EMAIL: ${{ secrets.NETHUNT_EMAIL }}
+          NETHUNT_API_KEY: ${{ secrets.NETHUNT_API_KEY }}
+          GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
