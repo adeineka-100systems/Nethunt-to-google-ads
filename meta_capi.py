@@ -315,6 +315,9 @@ def notify(text):
 # ---------------- основний цикл ----------------
 
 def main():
+    if not os.environ.get("META_PIXEL_ID") or not os.environ.get("META_ACCESS_TOKEN"):
+        print("META_PIXEL_ID / META_ACCESS_TOKEN ще не задані в Secrets - пропускаю запуск")
+        return
     now = datetime.now(timezone.utc)
     mode = "test" if TEST_CODE else "prod"
     w_state, w_queue, w_log = open_sheets()
