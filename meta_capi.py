@@ -16,8 +16,8 @@ NetHunt -> Meta Conversions API: успішні угоди (етап "Завер
   - лог спроб у Google Таблиці (аркуш meta_log), 90 днів, без телефонів/email/токена.
 
 Тестовий режим: задайте секрет META_TEST_EVENT_CODE (код із Events Manager -> Тестові події).
-  У тестовому режимі meta_sent_at НЕ заповнюється (meta_status = "test: sent"), тож після
-  вимкнення тесту угоди відправляться вже по-справжньому.
+  Події з тестовим кодом видно у вкладці "Тестові події", але Meta їх теж зараховує, тому угода
+  позначається як відправлена (meta_status = "sent (test)") і повторно не піде.
 
 Змінні середовища (GitHub Secrets):
   NETHUNT_EMAIL, NETHUNT_API_KEY, META_PIXEL_ID, META_ACCESS_TOKEN,
@@ -333,7 +333,7 @@ def main():
     state = read_kv(w_state)
     queue = {r[0]: {"attempts": int(r[1] or 0), "next_try": r[2], "last_error": r[3] if len(r) > 3 else ""}
              for r in w_queue.get_all_values()[1:] if r and r[0]}
-    since_key = f"since_{mode}"
+    since_key = "since"
     since = state.get(since_key) or (now - timedelta(days=MAX_AGE_DAYS)).isoformat()
 
     deals = {rec_id(d): d for d in fetch_updated(DEALS_FOLDER_ID, since)}
@@ -380,11 +380,9 @@ def main():
         value = event["custom_data"]["value"]
 
         if code == 200 and isinstance(body, dict) and body.get("events_received") == 1:
-            if mode == "test":
-                nh_update(deal_id, {F["status"]: "test: sent"})
-            else:
-                nh_update(deal_id, {F["sent_at"]: now.astimezone(TZ).isoformat(timespec="seconds"),
-                                    F["sent_value"]: value, F["status"]: "sent"})
+            # події з test_event_code Meta теж зараховує, тому і в тесті позначаємо угоду як відправлену
+            nh_update(deal_id, {F["sent_at"]: now.astimezone(TZ).isoformat(timespec="seconds"),
+                                F["sent_value"]: value, F["status"]: "sent (test)" if mode == "test" else "sent"})
             queue.pop(deal_id, None)
             log_rows.append([stamp, mode, deal_id, deal_no, event["event_name"], value, fields_used, code, "sent", fbtrace])
             continue
