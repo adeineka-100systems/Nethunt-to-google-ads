@@ -41,7 +41,9 @@ import requests
 DEALS_FOLDER_ID = "62a208e4331b7b685df23e2d"     # В2С угоди
 CONTACTS_FOLDER_ID = "62a208e4331b7b685df23e2e"  # Контакти
 WON_STAGE = "Завершена угода"
-CALL_TYPES = {"get call", "вхідний", "вихідний"}
+# Відправляємо ЛИШЕ угоди з сайту (поле "Тип" або "Тип звернення"). Усе інше ігнорується без запису статусу.
+SITE_TYPES = {"кошик", "get call", "chat online"}
+SITE_CONTACT_TYPES = {"кошик", "чат"}
 CURRENCY = "UAH"
 MAX_AGE_DAYS = 6
 RETRY_DELAYS_MIN = [1, 10, 60]   # далі кожні 6 год
@@ -188,6 +190,11 @@ def norm_city(s):
 
 # ---------------- подія ----------------
 
+def is_site_deal(f):
+    return (first(f.get(F["type"])).lower() in SITE_TYPES
+            or first(f.get(F["contact_type"])).lower() in SITE_CONTACT_TYPES)
+
+
 def close_time(f, now):
     """(event_time, close_dt) або (None, причина пропуску)."""
     close = parse_dt(f.get(F["close_analytics"]))
@@ -214,7 +221,7 @@ def build_event(deal, contact, now):
     if value <= 0:
         return None, "waiting: no budget"  # не блокує: відправиться, коли з'явиться бюджет
 
-    is_call = first(f.get(F["type"])).lower() in CALL_TYPES or first(f.get(F["contact_type"])).lower() == "дзвінок"
+    is_call = False  # CallDealWon вимкнено: передаємо лише угоди з сайту
     deal_id = rec_id(deal)
 
     ud = {}
@@ -338,7 +345,7 @@ def main():
     log_rows, hard_errors = [], []
     for deal_id, deal in deals.items():
         f = deal.get("fields") or {}
-        if first(f.get(F["stage"])) != WON_STAGE:
+        if first(f.get(F["stage"])) != WON_STAGE or not is_site_deal(f):
             queue.pop(deal_id, None)
             continue
         status = first(f.get(F["status"]))
